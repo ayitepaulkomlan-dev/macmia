@@ -44,16 +44,25 @@ OCR_DPI       = int(os.getenv("OCR_DPI", "300"))
 
 # Chemins de repli (Linux d'abord — le serveur ; puis Windows pour le dev local)
 _TESSERACT_FALLBACKS = [
+    # Linux (serveur)
     "/usr/bin/tesseract",
     "/usr/local/bin/tesseract",
+    # Windows (poste de développement)
     r"C:\Program Files\Tesseract-OCR\tesseract.exe",
     r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+    os.path.expandvars(r"%LOCALAPPDATA%\Tesseract-OCR\tesseract.exe"),
+    os.path.expandvars(r"%PROGRAMFILES%\Tesseract-OCR\tesseract.exe"),
+    os.path.expandvars(r"%USERPROFILE%\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"),
 ]
 _POPPLER_FALLBACKS = [
+    # Linux (serveur)
     "/usr/bin",
     "/usr/local/bin",
-    r"C:\Users\Komlan.Ayite\Downloads\Release-26.02.0-0\poppler-26.02.0\Library\bin",
+    # Windows (poste de développement)
     r"C:\poppler\Library\bin",
+    r"C:\Program Files\poppler\Library\bin",
+    os.path.expandvars(r"%USERPROFILE%\Downloads\Release-26.02.0-0\poppler-26.02.0\Library\bin"),
 ]
 
 
@@ -64,6 +73,39 @@ class CVExtractionError(Exception):
 # ══════════════════════════════════════════════════════════════════════════════
 # Dépendances système
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _install_hint(tool: str) -> str:
+    """Consigne d'installation adaptée au système hôte."""
+    if os.name == "nt":
+        hints = {
+            "tesseract": (
+                "Tesseract OCR est introuvable. Installez-le depuis "
+                "https://github.com/UB-Mannheim/tesseract/wiki (cochez le pack de langue "
+                "français), ou indiquez son chemin dans backend/.env : "
+                r"TESSERACT_CMD=C:\chemin\vers\tesseract.exe"
+            ),
+            "poppler": (
+                "Poppler est introuvable. Téléchargez-le depuis "
+                "https://github.com/oschwartz10612/poppler-windows/releases, puis indiquez "
+                "le dossier des binaires dans backend/.env : "
+                r"POPPLER_PATH=C:\chemin\vers\poppler\Library\bin"
+            ),
+        }
+    else:
+        hints = {
+            "tesseract": (
+                "Tesseract OCR est introuvable sur le serveur. "
+                "Installez-le (apt install tesseract-ocr tesseract-ocr-fra) "
+                "ou définissez TESSERACT_CMD dans backend/.env."
+            ),
+            "poppler": (
+                "Poppler est introuvable sur le serveur. "
+                "Installez-le (apt install poppler-utils) ou définissez POPPLER_PATH "
+                "dans backend/.env."
+            ),
+        }
+    return hints[tool]
+
 
 def _resolve_tesseract() -> str:
     import pytesseract
@@ -84,32 +126,26 @@ def _resolve_tesseract() -> str:
         log.info("Tesseract (PATH) : %s", found)
         return found
 
-    raise CVExtractionError(
-        "Tesseract OCR est introuvable sur le serveur. "
-        "Installez-le (apt install tesseract-ocr tesseract-ocr-fra) "
-        "ou définissez la variable TESSERACT_CMD."
-    )
+    raise CVExtractionError(_install_hint("tesseract"))
 
 
 def _resolve_poppler() -> str | None:
     candidates = [POPPLER_PATH] if POPPLER_PATH else []
     candidates += _POPPLER_FALLBACKS
     for path in candidates:
-        if path and (Path(path) / "pdftoppm").exists():
-            log.info("Poppler : %s", path)
-            return path
-        if path and (Path(path) / "pdftoppm.exe").exists():
+        if not path:
+            continue
+        base = Path(path)
+        if (base / "pdftoppm").exists() or (base / "pdftoppm.exe").exists():
             log.info("Poppler : %s", path)
             return path
 
     from shutil import which
     if which("pdftoppm"):
+        log.info("Poppler : PATH")
         return None  # pdf2image saura le trouver via le PATH
 
-    raise CVExtractionError(
-        "Poppler est introuvable sur le serveur. "
-        "Installez-le (apt install poppler-utils) ou définissez POPPLER_PATH."
-    )
+    raise CVExtractionError(_install_hint("poppler"))
 
 
 def check_dependencies() -> dict:
