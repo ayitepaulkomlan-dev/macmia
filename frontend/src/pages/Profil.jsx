@@ -50,6 +50,11 @@ export default function Profil() {
   const linkedinAvailable = Boolean(health?.linkedin?.proxycurl?.disponible)
   const linkedinConnected = profil?.source === 'linkedin'
   const ocrDown = health && !health.unreachable && !health.cv?.tesseract
+  const popplerDown = health && !health.unreachable && health.cv?.tesseract && !health.cv?.poppler
+  // Le serveur sait quelle consigne s'applique à son système : on la relaie
+  // telle quelle plutôt que d'en figer une côté navigateur.
+  const ocrHint = typeof health?.cv?.details?.tesseract === 'string' ? health.cv.details.tesseract : ''
+  const popplerHint = typeof health?.cv?.details?.poppler === 'string' ? health.cv.details.poppler : ''
 
   return (
     <div className="page">
@@ -66,7 +71,7 @@ export default function Profil() {
         <CvDropzone
           file={file}
           loading={cvLoading}
-          disabled={cvLoading || ocrDown}
+          disabled={cvLoading || ocrDown || popplerDown}
           onPick={handleCv}
           onClear={() => {
             setFile(null)
@@ -93,8 +98,12 @@ export default function Profil() {
       )}
       {ocrDown && (
         <Banner tone="red">
-          <strong>Le lecteur de CV est indisponible.</strong> Tesseract n’est pas installé sur le
-          serveur : <code>apt install tesseract-ocr tesseract-ocr-fra poppler-utils</code>.
+          <strong>Le lecteur de CV est indisponible.</strong> {ocrHint || 'Tesseract est introuvable.'}
+        </Banner>
+      )}
+      {popplerDown && (
+        <Banner tone="red">
+          <strong>Le lecteur de CV est indisponible.</strong> {popplerHint || 'Poppler est introuvable.'}
         </Banner>
       )}
       {error && <Banner tone="red">{error}</Banner>}
