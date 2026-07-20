@@ -277,6 +277,11 @@ CATEGORY_LABELS = {
 }
 
 
+def _section_text(sections: list, category: str) -> str:
+    """Concatène le texte des sections d'une catégorie donnée."""
+    return "\n".join(s.text for s in sections if s.category == category)
+
+
 def _sections_to_prompt_text(sections: list, max_chars: int = 6000) -> str:
     """Sérialise les sections avec des marqueurs ### pour guider le LLM."""
     parts, used = [], 0
@@ -318,16 +323,186 @@ def _extract_with_regex(text: str) -> dict:
     loc = re.findall(r"\b\d{5}\b[ \t,]+[A-ZÀ-Ÿ][A-Za-zÀ-ÿ' \-]{1,40}", text)
     out["localisation"] = loc[0].strip(" ,-") if loc else ""
 
-    annees = re.findall(r"\b(19[8-9]\d|20[0-2]\d)\b", text)
-    annees_pro = [int(a) for a in annees if 2000 <= int(a) <= ANNEE_COURANTE]
-    out["annees_experience"] = max(0, ANNEE_COURANTE - min(annees_pro)) if annees_pro else 0
-
     niveaux = re.findall(
         r"(?:Bac\s*[+\s]\s*\d|Master\s*\d?|Licence\s*\d?|Doctorat|PhD|Ingénieur|DUT|BTS|MBA|Bachelor)",
         text, re.IGNORECASE,
     )
     out["niveau_etudes"] = niveaux[0].strip() if niveaux else ""
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Expériences professionnelles et ancienneté
+# ══════════════════════════════════════════════════════════════════════════════
+
+_EN_COURS = re.compile(
+    r"(aujourd\W?hui|présent|present|actuel|en cours|to date|current|now|ce jour)",
+    re.IGNORECASE,
+)
+
+# Plages de dates : « 2019 - 2021 », « 01/2019 – 12/2021 », « Depuis 2021 », « 2021 — Aujourd'hui »
+_YEAR_RANGE = re.compile(
+    r"(?:depuis\s+)?"
+    r"(?:\d{1,2}[/.]){0,2}(?P<debut>19[8-9]\d|20[0-4]\d)"
+    r"(?:\s*(?:[-–—]|à|au|to)\s*"
+    r"(?:(?:\d{1,2}[/.]){0,2}(?P<fin>19[8-9]\d|20[0-4]\d)|(?P<encours>[A-Za-zÀ-ÿ' ]{2,14})))?",
+    re.IGNORECASE,
+)
+
+
+def _has_year_range(line: str):
+    """Une ligne porte-t-elle une plage de dates ouvrant un poste ?"""
+    m = _YEAR_RANGE.search(line)
+    if not m:
+        return None
+    if m.group("fin") or "depuis" in line.lower():
+        return m
+    if m.group("encours") and _EN_COURS.search(m.group("encours")):
+        return m
+    return None
+
+
+def _parse_experiences(section_text: str) -> list:
+    """
+    Relève les postes de la section Expérience à partir de leurs plages de dates.
+
+    La mise en page usuelle d'un CV place l'intitulé AU-DESSUS de la ligne de
+    dates, et l'employeur sur cette même ligne :
+
+        Data Analyst
+        Société Générale · 2021 — Aujourd'hui
+        Analyse de données clients, dashboards Power BI.
+
+    On repère donc les lignes de dates, puis on regarde en arrière pour
+    l'intitulé et en avant pour la mission. Ce repli sert quand le modèle de
+    langue est absent, et sert de garde-fou : les dates viennent du document,
+    jamais d'une reformulation.
+    """
+    if not section_text.strip():
+        return []
+
+    lines = [l.strip() for l in section_text.split("\n") if l.strip()]
+    date_idx = [i for i, l in enumerate(lines) if _has_year_range(l)]
+    if not date_idx:
+        return []
+
+    experiences = []
+    for k, i in enumerate(date_idx):
+        m = _has_year_range(lines[i])
+        debut = int(m.group("debut"))
+        fin = int(m.group("fin")) if m.group("fin") else None
+        en_cours = fin is None
+
+        # Ce qui reste de la ligne une fois les dates ôtées. Les parenthèses
+        # vidées de leur date sont retirées, mais « INSEE (stage) » garde la
+        # sienne : on ne rogne que les séparateurs.
+        reste = _YEAR_RANGE.sub("", lines[i])
+        reste = re.sub(r"\(\s*\)", "", reste)
+        reste = reste.strip(" -–—|,·•")
+
+        # Intitulé : la ligne précédente, si elle n'est ni une autre ligne de
+        # dates ni une phrase de description (celles-ci se terminent par un point).
+        def title_like(idx):
+            if idx < 0 or idx in date_idx:
+                return ""
+            l = lines[idx]
+            return l if len(l) < 70 and not l.rstrip().endswith(".") else ""
+
+        prev = title_like(i - 1)
+
+        if reste and prev:
+            # « Data Analyst » / « Société Générale · 2021 — 2024 »
+            poste, entreprise = prev, reste
+        elif not reste and prev:
+            # « Consultant Data » / « Accenture » / « Depuis 2022 » :
+            # la ligne de dates est seule, l'employeur est juste au-dessus.
+            poste, entreprise = title_like(i - 2) or prev, prev if title_like(i - 2) else ""
+        elif " — " in reste or " - " in reste or " | " in reste:
+            parts = re.split(r"\s+[—\-|]\s+", reste, maxsplit=1)
+            poste, entreprise = parts[0], (parts[1] if len(parts) > 1 else "")
+        else:
+            poste, entreprise = reste, ""
+
+        # Mission : les lignes suivantes, en excluant l'intitulé du poste suivant
+        next_date = date_idx[k + 1] if k + 1 < len(date_idx) else len(lines)
+        desc_end = next_date - 1 if next_date < len(lines) else next_date
+        description = " ".join(lines[i + 1:max(i + 1, desc_end)]).strip()
+
+        experiences.append({
+            "poste": poste.strip(),
+            "entreprise": entreprise.strip(),
+            "debut": debut,
+            "fin": fin,
+            "en_cours": en_cours,
+            "description": description,
+        })
+
+    experiences.sort(key=lambda e: e["debut"], reverse=True)
+    return experiences
+
+
+def _normalize_experiences(raw) -> list:
+    """
+    Met en forme les expériences renvoyées par le modèle de langue.
+
+    Le modèle est libre dans sa réponse : il peut omettre un champ, écrire
+    l'année en texte, ou rendre une simple chaîne. On ne garde que les entrées
+    dont l'année de début est exploitable — c'est elle qui fonde l'ancienneté,
+    elle ne peut pas être approximative.
+    """
+    if not isinstance(raw, list):
+        return []
+
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+
+        debut = item.get("debut")
+        if isinstance(debut, str):
+            m = re.search(r"(19[8-9]\d|20[0-4]\d)", debut)
+            debut = int(m.group(1)) if m else None
+        if not isinstance(debut, int) or not (1980 <= debut <= ANNEE_COURANTE):
+            continue
+
+        fin = item.get("fin")
+        if isinstance(fin, str):
+            m = re.search(r"(19[8-9]\d|20[0-4]\d)", fin)
+            fin = int(m.group(1)) if m else None
+        if not isinstance(fin, int) or not (1980 <= fin <= ANNEE_COURANTE + 1):
+            fin = None
+
+        out.append({
+            "poste": str(item.get("poste") or item.get("titre") or "").strip(),
+            "entreprise": str(item.get("entreprise") or "").strip(),
+            "debut": debut,
+            "fin": fin,
+            "en_cours": fin is None,
+            "description": str(item.get("description") or "").strip(),
+        })
+
+    out.sort(key=lambda e: e["debut"], reverse=True)
+    return out
+
+
+def _compute_experience_years(experiences: list, section_text: str) -> int:
+    """
+    Ancienneté professionnelle = année courante − première année de poste.
+
+    L'année est cherchée dans la seule section Expérience. La chercher dans
+    tout le document comptait l'année d'un diplôme ou d'une certification :
+    une licence en 2017 et un premier poste en 2021 donnaient 9 ans au lieu
+    de 4.
+    """
+    debuts = [e["debut"] for e in experiences if e.get("debut")]
+    if not debuts and section_text.strip():
+        debuts = [
+            int(y) for y in re.findall(r"\b(19[8-9]\d|20[0-4]\d)\b", section_text)
+            if 1980 <= int(y) <= ANNEE_COURANTE
+        ]
+    if not debuts:
+        return 0
+    return max(0, ANNEE_COURANTE - min(debuts))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -366,11 +541,19 @@ RÈGLE LANGUES : pour le niveau, utilise UNIQUEMENT "Natif", "C2", "C1", "B2", "
 Devant un tableau Europass à plusieurs colonnes, prends la compréhension écrite comme
 niveau représentatif. N'écris jamais plusieurs niveaux pour une même langue.
 
+RÈGLE EXPÉRIENCES : ne relève QUE les postes de la section EXPÉRIENCE PROFESSIONNELLE.
+"debut" et "fin" sont des années à 4 chiffres. Pour un poste en cours, mets "fin": null.
+N'y mets jamais un stage listé sous FORMATION ni une date de diplôme.
+
 Retourne UNIQUEMENT ce JSON :
 {{
   "nom": "Prénom NOM tel qu'écrit",
   "poste_actuel": "titre tel qu'écrit",
   "competences_brutes": ["compétence ou outil copié mot pour mot du CV"],
+  "experiences": [
+    {{"poste": "intitulé exact", "entreprise": "employeur exact", "debut": 2021, "fin": null,
+      "description": "mission telle qu'écrite"}}
+  ],
   "diplomes": [{{"titre": "titre exact", "etablissement": "établissement exact", "annee": 2020}}],
   "langues": [{{"langue": "Français", "niveau": "Natif"}}],
   "resume_profil": "2 phrases résumant le profil"
@@ -553,6 +736,44 @@ def map_to_rncp(competences_brutes: list) -> dict:
     return result
 
 
+def compute_rncp_coverage(competences_rncp: dict) -> dict:
+    """
+    Mesure la couverture du référentiel RNCP par le profil.
+
+    Le score est la part des 8 blocs sur lesquels au moins une compétence a
+    été relevée. C'est une mesure vérifiable, contrairement à une adéquation
+    à un objectif métier, qui suppose un objectif — lequel n'existe pas encore
+    à ce stade du parcours.
+
+    Les blocs vides ne sont pas un jugement : ce sont les axes sur lesquels
+    une formation apportera le plus.
+    """
+    couverts = [b for b, c in competences_rncp.items() if c]
+    total = len(RNCP_REFERENTIEL)
+    score = round(len(couverts) / total * 100) if total else 0
+
+    forces = sorted(
+        (
+            {"id": b, "label": RNCP_REFERENTIEL[b]["label"], "nb": len(c)}
+            for b, c in competences_rncp.items() if c
+        ),
+        key=lambda x: -x["nb"],
+    )
+    ecarts = [
+        {"id": b, "label": RNCP_REFERENTIEL[b]["label"]}
+        for b in RNCP_REFERENTIEL
+        if not competences_rncp.get(b)
+    ]
+
+    return {
+        "score": score,
+        "blocs_couverts": len(couverts),
+        "blocs_total": total,
+        "forces": forces[:3],
+        "ecarts": ecarts,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Pipeline complet
 # ══════════════════════════════════════════════════════════════════════════════
@@ -583,7 +804,7 @@ def extract_cv(pdf_bytes: bytes, filename: str = "cv.pdf", use_llm: bool = True)
     sections = segment_into_blocks(lines)
     structured_text = _sections_to_prompt_text(sections)
 
-    # 3. Regex (contact, niveau, expérience)
+    # 3. Regex (contact, niveau)
     regex_data = _extract_with_regex(cv_text_plat)
 
     # 4. LLM ou repli
@@ -595,9 +816,18 @@ def extract_cv(pdf_bytes: bytes, filename: str = "cv.pdf", use_llm: bool = True)
     if llm_data is None:
         llm_data = _extract_without_llm(cv_text_plat)
 
-    # 5. Mapping RNCP
+    # 5. Expériences : le LLM les structure, la section les valide.
+    #    Les dates viennent toujours du document, jamais d'une reformulation.
+    exp_text = _section_text(sections, "experience")
+    experiences = _normalize_experiences(llm_data.get("experiences"))
+    if not experiences:
+        experiences = _parse_experiences(exp_text)
+    annees_experience = _compute_experience_years(experiences, exp_text)
+
+    # 6. Mapping RNCP + couverture
     competences_brutes = llm_data.get("competences_brutes", []) or []
     competences_rncp = map_to_rncp(competences_brutes)
+    couverture = compute_rncp_coverage(competences_rncp)
 
     # Blocs RNCP non vides, enrichis de leur libellé — prêts à afficher
     blocs_rncp = [
@@ -620,11 +850,13 @@ def extract_cv(pdf_bytes: bytes, filename: str = "cv.pdf", use_llm: bool = True)
         "github": regex_data.get("github", ""),
         "localisation": regex_data.get("localisation", ""),
         "niveau_etudes": regex_data.get("niveau_etudes", ""),
-        "annees_experience": regex_data.get("annees_experience", 0),
+        "annees_experience": annees_experience,
         "resume_profil": llm_data.get("resume_profil", ""),
         "competences_brutes": competences_brutes,
         "competences_rncp": competences_rncp,
         "blocs_rncp": blocs_rncp,
+        "couverture_rncp": couverture,
+        "experiences": experiences,
         "diplomes": llm_data.get("diplomes", []) or [],
         "langues": llm_data.get("langues", []) or [],
         "meta": {
