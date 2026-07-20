@@ -91,6 +91,13 @@ export default function ProfileView({ profil }) {
       {/* Corps : contenu principal + panneau latéral */}
       <div className="profile-cols">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 20, minWidth: 0 }}>
+          {profil.resume_profil && (
+            <div className="card">
+              <h3 className="section-title" style={{ marginBottom: 12 }}>Résumé</h3>
+              <p style={{ fontSize: 13, color: 'var(--ink-3)', lineHeight: 1.65 }}>{profil.resume_profil}</p>
+            </div>
+          )}
+
           {hasExp && <ExperienceCard experiences={profil.experiences} />}
           {hasFormation && <FormationCard diplomes={profil.diplomes} />}
 
@@ -131,13 +138,6 @@ export default function ProfileView({ profil }) {
                   </div>
                 ))}
               </div>
-            </div>
-          )}
-
-          {profil.resume_profil && (
-            <div className="card">
-              <h3 className="section-title" style={{ marginBottom: 12 }}>Résumé</h3>
-              <p style={{ fontSize: 13, color: 'var(--ink-3)', lineHeight: 1.65 }}>{profil.resume_profil}</p>
             </div>
           )}
         </div>
