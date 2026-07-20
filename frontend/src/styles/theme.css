@@ -99,7 +99,8 @@ input {
 
 .page {
   padding: 30px 34px 44px;
-  max-width: 1060px;
+  max-width: 1120px;
+  margin: 0 auto;
 }
 
 .page-title {
@@ -336,6 +337,142 @@ input {
   border-radius: 5px;
   background: linear-gradient(90deg, var(--blue), var(--green));
   transition: width 0.5s ease;
+}
+
+/* ── Frise des expériences ────────────────────────────────────────────── */
+
+.timeline {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.timeline-item {
+  position: relative;
+  display: flex;
+  gap: 14px;
+  padding-left: 2px;
+}
+/* Le trait relie les points entre eux, sauf après le dernier. */
+.timeline-item:not(:last-child)::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 18px;
+  bottom: -20px;
+  width: 1.5px;
+  background: var(--line-2);
+}
+.timeline-dot {
+  width: 11px;
+  height: 11px;
+  flex: none;
+  margin-top: 4px;
+  border-radius: 50%;
+  border: 2.5px solid var(--blue);
+  background: var(--surface);
+  z-index: 1;
+}
+.timeline-dot.is-current {
+  background: var(--blue);
+  box-shadow: 0 0 0 3px rgba(47, 106, 225, 0.16);
+}
+
+/* ── Colonnes de la page Profil ───────────────────────────────────────── */
+
+/* Le contenu à gauche, l'analyse à droite — cette dernière garde une largeur
+   fixe : un anneau et deux listes courtes n'ont pas besoin de s'étirer. */
+.profile-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 328px;
+  gap: 22px;
+  align-items: start;
+}
+
+/* ── Adaptation aux écrans étroits ────────────────────────────────────── */
+
+@media (max-width: 1080px) {
+  .profile-cols {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 860px) {
+  /* La barre latérale passe en bandeau horizontal au-dessus du contenu. */
+  .app {
+    flex-direction: column;
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+  .sidebar {
+    width: 100%;
+    height: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+    position: sticky;
+    top: 0;
+    z-index: 20;
+  }
+  .sidebar-logo {
+    padding: 12px 16px 8px;
+    justify-content: flex-start;
+  }
+  .sidebar-logo img {
+    width: 104px;
+  }
+  .sidebar-nav {
+    flex-direction: row;
+    overflow-x: auto;
+    gap: 6px;
+    padding: 0 12px 10px;
+  }
+  .sidebar-nav > div {
+    display: flex;
+    gap: 6px;
+  }
+  .nav-label {
+    display: none;
+  }
+  .nav-btn {
+    width: auto;
+    white-space: nowrap;
+  }
+  .nav-btn .nav-soon {
+    display: none;
+  }
+  /* Le bloc de pied de barre n'a plus sa place dans un bandeau. */
+  .sidebar > div:last-child {
+    display: none;
+  }
+  .main {
+    height: auto;
+    overflow: visible;
+  }
+  .page {
+    padding: 22px 18px 40px;
+  }
+  .page-title {
+    font-size: 22px;
+  }
+}
+
+@media (max-width: 560px) {
+  .page {
+    padding: 18px 14px 32px;
+  }
+  .card,
+  .card-xl {
+    padding: 17px;
+  }
+  .meta-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+  .meta-val {
+    text-align: left;
+  }
 }
 
 /* ── Animations ───────────────────────────────────────────────────────── */
