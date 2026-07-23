@@ -45,7 +45,9 @@ function Contact({ Icon, children }) {
 export default function ProfileView({ profil }) {
   const { pct, missing } = completeness(profil)
   const blocs = profil.blocs_rncp || []
-  const degraded = profil.source === 'regex'
+  const degraded = profil.source === 'regles'
+  const nonStructure = profil.meta?.non_structure || {}
+  const aDuTexteNonRattache = Object.values(nonStructure).some((v) => v?.length)
   const hasExp = (profil.experiences || []).length > 0
   const hasFormation = (profil.diplomes || []).length > 0
 
@@ -80,10 +82,12 @@ export default function ProfileView({ profil }) {
       </div>
 
       {degraded && (
-        <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', background: 'var(--amber-soft)', border: '1px solid #f6e0cd', borderRadius: 12, padding: '13px 15px', color: '#7a4a18' }}>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', background: 'var(--blue-soft)', border: '1px solid var(--blue-border)', borderRadius: 12, padding: '13px 15px', color: 'var(--ink-2)' }}>
           <IconAlert size={16} />
           <div style={{ fontSize: 12.5, lineHeight: 1.5 }}>
-            <strong>Lecture sans modèle de langue.</strong> Le service Ollama n’a pas répondu : les compétences ont été relevées par règles, ce qui en laisse passer certaines. Démarrez Ollama puis relancez l’analyse pour un relevé complet.
+            <strong>Relevé par règles.</strong> Le modèle de langue n’a pas répondu : votre parcours,
+            vos diplômes et vos compétences ont été lus directement dans le document. Seul le résumé
+            de profil, qui demande une reformulation, n’a pas pu être rédigé.
           </div>
         </div>
       )}
@@ -170,7 +174,7 @@ export default function ProfileView({ profil }) {
         <details className="card" style={{ padding: '16px 22px' }}>
           <summary style={{ cursor: 'pointer', font: '700 12.5px/1 var(--font)', color: 'var(--ink-3)' }}>Ce que le lecteur a vu dans le document</summary>
           <div style={{ marginTop: 14, fontSize: 12, color: 'var(--muted)', lineHeight: 1.7 }}>
-            {profil.meta.pages} page(s) · {profil.meta.blocs_ocr} blocs de texte · {profil.meta.caracteres} caractères · relevé par {profil.source === 'llm' ? 'modèle de langue' : 'règles'}
+            {profil.meta.pages} page(s) · {profil.meta.blocs_ocr} blocs de texte · {profil.meta.caracteres} caractères · relevé par {profil.source === 'llm+regles' ? 'règles et modèle de langue' : 'règles'}
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 }}>
               {(profil.meta.sections || []).map((s, i) => (
                 <span key={i} className={`chip ${s.confiance === 'semantic' ? 'chip-green' : 'chip-gray'}`} title={s.confiance === 'semantic' ? 'Titre de section reconnu' : 'Détecté à la mise en forme'}>
@@ -178,6 +182,22 @@ export default function ProfileView({ profil }) {
                 </span>
               ))}
             </div>
+
+            {/* Rien ne disparaît en silence : ce que les règles n'ont pas su
+                rattacher est montré tel quel plutôt qu'écarté. */}
+            {aDuTexteNonRattache && (
+              <div style={{ marginTop: 16, paddingTop: 14, borderTop: '1px solid var(--line-3)' }}>
+                <div style={{ font: '700 12px/1 var(--font)', color: 'var(--ink-3)', marginBottom: 8 }}>
+                  Lu dans le document, non rattaché
+                </div>
+                {Object.entries(nonStructure).map(([section, lignes]) => (
+                  <div key={section} style={{ marginBottom: 8 }}>
+                    <span style={{ color: 'var(--muted-2)', textTransform: 'capitalize' }}>{section} : </span>
+                    {lignes.join(' · ')}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </details>
       )}
