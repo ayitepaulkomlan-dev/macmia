@@ -27,6 +27,14 @@ from pathlib import Path
 from .cv_columns import segment_page
 from .cv_layout import blocks_to_text, dataframe_to_blocks, ocr_block_from_image
 from .cv_lines import blocks_to_lines
+from .cv_parse import (
+    fusionne_diplomes,
+    fusionne_langues,
+    fusionne_listes,
+    parse_competences,
+    parse_diplomes,
+    parse_langues,
+)
 from .cv_sections import segment_into_blocks
 from .rncp import RNCP_REFERENTIEL
 
@@ -39,6 +47,10 @@ TESSERACT_CMD = os.getenv("TESSERACT_CMD", "")
 POPPLER_PATH  = os.getenv("POPPLER_PATH", "")
 OLLAMA_URL    = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "llama3.1")
+# Sans GPU, un modèle 8B met couramment plus de 3 minutes sur un CV dense.
+OLLAMA_TIMEOUT     = int(os.getenv("OLLAMA_TIMEOUT", "420"))
+OLLAMA_KEEP_ALIVE  = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1600"))
 OCR_LANG      = os.getenv("OCR_LANG", "fra+eng")
 OCR_DPI       = int(os.getenv("OCR_DPI", "300"))
 
@@ -509,13 +521,33 @@ def _compute_experience_years(experiences: list, section_text: str) -> int:
 # Étape 3 — LLM : extraction brute (mot pour mot)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _call_ollama(prompt: str, timeout: int = 180) -> dict:
+def _call_ollama(prompt: str, timeout: int | None = None) -> dict:
+    """
+    Appelle Ollama en exigeant une sortie JSON.
+
+    `format: "json"` contraint le décodage au niveau du moteur : le modèle ne
+    peut plus produire de phrase d'introduction ni de bloc ```json, causes les
+    plus fréquentes d'échec de parsing. `keep_alive` garde le modèle en
+    mémoire : sans cela Ollama le décharge après quelques minutes d'inactivité
+    et la requête suivante paie plusieurs Go de rechargement avant de générer,
+    ce qui suffit à dépasser le délai sur une machine sans GPU.
+    """
     import requests
 
     r = requests.post(
         f"{OLLAMA_URL}/api/generate",
-        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-        timeout=timeout,
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+            "options": {
+                "temperature": 0,          # relevé littéral, pas de créativité
+                "num_predict": OLLAMA_NUM_PREDICT,
+            },
+        },
+        timeout=timeout or OLLAMA_TIMEOUT,
     )
     r.raise_for_status()
     raw = r.json()["response"]
@@ -565,126 +597,83 @@ CV (structuré par sections) :
 
 
 def _extract_with_llm(structured_text: str) -> dict | None:
-    try:
-        result = _call_ollama(_PROMPT_EXTRACTION.format(structured=structured_text))
-        log.info("LLM : %d compétences extraites", len(result.get("competences_brutes", [])))
-        return result
-    except Exception as e:
-        log.warning("LLM indisponible (%s) — bascule sur l'extraction sans LLM", e)
-        return None
+    """
+    Relevé par le modèle de langue. Un premier appel peut expirer simplement
+    parce qu'Ollama chargeait le modèle ; on retente alors une fois, le modèle
+    étant désormais en mémoire.
+    """
+    import requests
+
+    prompt = _PROMPT_EXTRACTION.format(structured=structured_text)
+    for tentative in (1, 2):
+        try:
+            result = _call_ollama(prompt)
+            log.info("LLM : %d compétences, %d diplômes",
+                     len(result.get("competences_brutes") or []),
+                     len(result.get("diplomes") or []))
+            return result
+        except requests.exceptions.Timeout as e:
+            if tentative == 1:
+                log.warning("LLM : délai dépassé, nouvelle tentative (modèle désormais chargé)")
+                continue
+            log.warning("LLM indisponible (%s) — relevé par règles seules", e)
+        except Exception as e:
+            log.warning("LLM indisponible (%s) — relevé par règles seules", e)
+            break
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Étape 3b — Extraction de secours sans LLM
+# Étape 3b — Relevé par règles, à partir des sections détectées
 # ══════════════════════════════════════════════════════════════════════════════
 
-_SECTION_COMP_RE = re.compile(
-    r"^(COMP[EÉ]TENCES?(?:\s+(?:INFORMATIQUES?|TECHNIQUES?|ACQUISES?|DIGITALES?))?"
-    r"|SKILLS?|OUTILS?|TECHNOLOGIES?)\s*:?\s*$", re.IGNORECASE)
-_SECTION_STOP_RE = re.compile(
-    r"^(EXP[EÉ]RIENCE|FORMATION|[EÉ]TUDES?|LANGUES?|PUBLICATIONS?|MANAGEMENT|LEADERSHIP"
-    r"|B[EÉ]N[EÉ]VOLAT|LOISIRS?|PERMIS|COMP[EÉ]TENCES\s+EN\s+MANAGEMENT)", re.IGNORECASE)
-_IGNORE_RE = re.compile(
-    r"^(langue|niveaux|comprehension|compréhension|expression|orale|ecrite|écrite|continu|interaction"
-    r"|\d{2}/\d{2}/\d{4}|[A-C][12]\b|(ANGLAIS|ALLEMAND|ESPAGNOL)\s+[A-C][12]"
-    r"|Domaine.{0,10}d.etudes|Dipl.me final|Th.{1,3}se.{0,5}m.moire|Site web)", re.IGNORECASE)
-_DIPLOME_KEYWORDS = re.compile(
-    r"(INGENIEUR|INGÉNIEUR|MASTER|BACHELOR|LICENCE|BACCALAUREAT|BACCALAURÉAT|DOCTORAT|PHD"
-    r"|DUT|BTS|MBA|ECOLE|ÉCOLE|UNIVERSITÉ|UNIVERSITE|SUPERIEURE|SUPÉRIEURE|NATIONALE|INSTITUT)",
-    re.IGNORECASE)
+def _extract_par_regles(sections: list) -> dict:
+    """
+    Relevé déterministe, lu dans les sections isolées par la segmentation.
 
+    C'est la source de vérité de l'extraction : aucun modèle n'intervient, donc
+    aucune invention n'est possible. Ce relevé sert à la fois de secours quand
+    le modèle de langue est indisponible, et de garde-fou quand il répond — les
+    deux relevés étant ensuite fusionnés par union.
+    """
+    txt_comp = _section_text(sections, "competences")
+    txt_form = _section_text(sections, "formation")
+    txt_lang = _section_text(sections, "langues")
+    txt_head = _section_text(sections, "header")
+    txt_exp  = _section_text(sections, "experience")
 
-def _extract_without_llm(cv_text_plat: str) -> dict:
-    """Repli déterministe : parsing du texte plat quand Ollama est absent."""
-    result = {"nom": "", "poste_actuel": "", "competences_brutes": [],
-              "diplomes": [], "langues": [], "resume_profil": ""}
+    competences, comp_restes = parse_competences(txt_comp)
+    diplomes, dipl_restes    = parse_diplomes(txt_form)
+    langues, lang_restes     = parse_langues(txt_lang)
 
-    for line in cv_text_plat.split("\n"):
-        line = line.strip()
-        if line and len(line) < 60 and not any(c in line for c in ["@", "http", "Tel", "|", "/"]):
-            result["nom"] = line
+    # Nom et poste : les deux premières lignes utiles de l'en-tête
+    nom, poste = "", ""
+    for ligne in [l.strip() for l in txt_head.split("\n") if l.strip()]:
+        if any(c in ligne for c in ("@", "http", "www.")) or re.search(r"\d{4}", ligne):
+            continue
+        if not nom and 2 <= len(ligne) <= 60:
+            nom = ligne
+        elif not poste and 3 <= len(ligne) <= 90:
+            poste = ligne
             break
 
-    m = re.search(r"(?:MES INFORMATIONS|PROFIL)[^\n]*\n([^\n]{10,150})", cv_text_plat, re.IGNORECASE)
-    if m:
-        result["poste_actuel"] = m.group(1).strip()
+    log.info("Règles : %d compétences, %d diplômes, %d langues",
+             len(competences), len(diplomes), len(langues))
 
-    # Fusion des lignes de continuation dans la section compétences
-    merged, buf, in_comp_pre = [], "", False
-    for line in cv_text_plat.split("\n"):
-        s = line.strip()
-        if _SECTION_COMP_RE.match(s):
-            if buf: merged.append(buf); buf = ""
-            in_comp_pre = True; merged.append(s); continue
-        if in_comp_pre and _SECTION_STOP_RE.match(s):
-            if buf: merged.append(buf); buf = ""
-            in_comp_pre = False; merged.append(s); continue
-        if not in_comp_pre:
-            if buf: merged.append(buf); buf = ""
-            merged.append(s); continue
-        is_cont = (buf and not re.search(r"[.;)!?]\s*$", buf)
-                   and not re.match(r"^[+\-*•.▪▸►]", s) and s)
-        if is_cont:
-            sep = "" if buf.endswith("|") or s.startswith("|") else " "
-            buf = buf.rstrip() + sep + s
-        else:
-            if buf: merged.append(buf)
-            buf = s
-    if buf: merged.append(buf)
-
-    raw_comps, in_comp = [], False
-    for s in merged:
-        if not s: continue
-        if _SECTION_COMP_RE.match(s): in_comp = True; continue
-        if in_comp and _SECTION_STOP_RE.match(s): in_comp = False; continue
-        if not in_comp or _IGNORE_RE.match(s): continue
-        clean = re.sub(r"^[+\-*•.▪▸►\u25ba\u25cf\uf0b7\u2022]\s*", "", s).strip()
-        if len(clean) < 3 or len(clean) > 400: continue
-        if "|" in clean:
-            raw_comps += [p.strip().rstrip(";,.") for p in clean.split("|") if len(p.strip()) > 2]
-        else:
-            raw_comps.append(clean)
-
-    seen = set()
-    for c in raw_comps:
-        key = c.lower().strip().rstrip(";,.")
-        if key and key not in seen and len(key) > 3:
-            seen.add(key)
-            result["competences_brutes"].append(c.strip())
-
-    diplome_re = re.compile(r"(\d{2}/\d{2}/\d{4})\s*-\s*\d{2}/\d{2}/\d{4}[^\n]*\n([^\n]{5,120})")
-    seen_titres = set()
-    for m in diplome_re.finditer(cv_text_plat):
-        titre = m.group(2).strip()
-        if not _DIPLOME_KEYWORDS.search(titre) or titre.lower() in seen_titres:
-            continue
-        seen_titres.add(titre.lower())
-        annee = re.search(r"\b(\d{4})\b", m.group(1))
-        etabl = ""
-        for l in cv_text_plat[m.end():].split("\n")[:2]:
-            l = l.strip()
-            if l and not re.match(r"\d{2}/", l) and len(l) < 100 and not _DIPLOME_KEYWORDS.search(l):
-                etabl = l
-                break
-        result["diplomes"].append({
-            "titre": titre, "etablissement": etabl,
-            "annee": int(annee.group(1)) if annee else 0,
-        })
-
-    if re.search(r"maternelle.{0,20}FRENCH", cv_text_plat, re.IGNORECASE):
-        result["langues"].append({"langue": "Français", "niveau": "Natif"})
-    lang_re = re.compile(r"^(ANGLAIS|ALLEMAND|ESPAGNOL|ARABE|ENGLISH|GERMAN|ARABIC)\s+([A-C][12])",
-                         re.IGNORECASE | re.MULTILINE)
-    seen_langs = set()
-    for m in lang_re.finditer(cv_text_plat):
-        lang = m.group(1).capitalize()
-        if lang.lower() not in seen_langs:
-            seen_langs.add(lang.lower())
-            result["langues"].append({"langue": lang, "niveau": m.group(2).upper()})
-
-    log.info("Sans LLM : %d compétences, %d diplômes, %d langues",
-             len(result["competences_brutes"]), len(result["diplomes"]), len(result["langues"]))
-    return result
+    return {
+        "nom": nom,
+        "poste_actuel": poste,
+        "competences_brutes": competences,
+        "experiences": _parse_experiences(txt_exp),
+        "diplomes": diplomes,
+        "langues": langues,
+        "resume_profil": "",
+        "non_structure": {
+            "competences": comp_restes,
+            "formation": dipl_restes,
+            "langues": lang_restes,
+        },
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -807,25 +796,40 @@ def extract_cv(pdf_bytes: bytes, filename: str = "cv.pdf", use_llm: bool = True)
     # 3. Regex (contact, niveau)
     regex_data = _extract_with_regex(cv_text_plat)
 
-    # 4. LLM ou repli
-    llm_data, source = None, "regex"
-    if use_llm:
-        llm_data = _extract_with_llm(structured_text)
-        if llm_data:
-            source = "llm"
-    if llm_data is None:
-        llm_data = _extract_without_llm(cv_text_plat)
+    # 4. Relevé par règles — toujours effectué, il fait référence
+    regles = _extract_par_regles(sections)
 
-    # 5. Expériences : le LLM les structure, la section les valide.
+    # 5. Le modèle de langue complète, il ne remplace pas.
+    #    La fusion se fait par union : une formation ou une compétence vue par
+    #    un seul des deux relevés subsiste. C'est ce qui évite qu'une
+    #    information disparaisse parce qu'un seul lecteur l'a manquée.
+    llm_data = _extract_with_llm(structured_text) if use_llm else None
+    source = "llm+regles" if llm_data else "regles"
+
+    if llm_data:
+        donnees = {
+            "nom": llm_data.get("nom") or regles["nom"],
+            "poste_actuel": llm_data.get("poste_actuel") or regles["poste_actuel"],
+            "resume_profil": llm_data.get("resume_profil", ""),
+            "competences_brutes": fusionne_listes(
+                regles["competences_brutes"], llm_data.get("competences_brutes")),
+            "diplomes": fusionne_diplomes(regles["diplomes"], llm_data.get("diplomes")),
+            "langues": fusionne_langues(regles["langues"], llm_data.get("langues")),
+            "experiences": llm_data.get("experiences"),
+        }
+    else:
+        donnees = dict(regles)
+
+    # 6. Expériences : le LLM les structure, la section les valide.
     #    Les dates viennent toujours du document, jamais d'une reformulation.
     exp_text = _section_text(sections, "experience")
-    experiences = _normalize_experiences(llm_data.get("experiences"))
+    experiences = _normalize_experiences(donnees.get("experiences"))
     if not experiences:
         experiences = _parse_experiences(exp_text)
     annees_experience = _compute_experience_years(experiences, exp_text)
 
-    # 6. Mapping RNCP + couverture
-    competences_brutes = llm_data.get("competences_brutes", []) or []
+    # 7. Mapping RNCP + couverture
+    competences_brutes = donnees.get("competences_brutes", []) or []
     competences_rncp = map_to_rncp(competences_brutes)
     couverture = compute_rncp_coverage(competences_rncp)
 
@@ -842,8 +846,8 @@ def extract_cv(pdf_bytes: bytes, filename: str = "cv.pdf", use_llm: bool = True)
     return {
         "source": source,                       # "llm" | "regex"
         "filename": filename,
-        "nom": llm_data.get("nom", ""),
-        "poste_actuel": llm_data.get("poste_actuel", ""),
+        "nom": donnees.get("nom", ""),
+        "poste_actuel": donnees.get("poste_actuel", ""),
         "email": regex_data.get("email", ""),
         "telephone": regex_data.get("telephone", ""),
         "linkedin": regex_data.get("linkedin", ""),
@@ -851,14 +855,14 @@ def extract_cv(pdf_bytes: bytes, filename: str = "cv.pdf", use_llm: bool = True)
         "localisation": regex_data.get("localisation", ""),
         "niveau_etudes": regex_data.get("niveau_etudes", ""),
         "annees_experience": annees_experience,
-        "resume_profil": llm_data.get("resume_profil", ""),
+        "resume_profil": donnees.get("resume_profil", ""),
         "competences_brutes": competences_brutes,
         "competences_rncp": competences_rncp,
         "blocs_rncp": blocs_rncp,
         "couverture_rncp": couverture,
         "experiences": experiences,
-        "diplomes": llm_data.get("diplomes", []) or [],
-        "langues": llm_data.get("langues", []) or [],
+        "diplomes": donnees.get("diplomes", []) or [],
+        "langues": donnees.get("langues", []) or [],
         "meta": {
             "pages": len(images),
             "blocs_ocr": len(blocks),
@@ -867,6 +871,10 @@ def extract_cv(pdf_bytes: bytes, filename: str = "cv.pdf", use_llm: bool = True)
                 for s in sections
             ],
             "caracteres": len(cv_text_plat),
+            # Lignes lues dans une section mais qu'aucune règle n'a su structurer.
+            # Elles sont remontées plutôt qu'écartées : rien ne doit disparaître
+            # en silence, l'utilisateur doit pouvoir constater ce qui a été vu.
+            "non_structure": {k: v for k, v in (regles.get("non_structure") or {}).items() if v},
         },
         "texte_brut": cv_text_plat,
     }
