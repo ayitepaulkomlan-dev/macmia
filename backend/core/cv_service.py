@@ -27,6 +27,7 @@ from pathlib import Path
 from .cv_columns import segment_page
 from .cv_layout import blocks_to_text, dataframe_to_blocks, ocr_block_from_image
 from .cv_lines import blocks_to_lines
+from .llm import LLM_MODEL, check_llm, generate_json
 from .cv_parse import (
     fusionne_diplomes,
     fusionne_langues,
@@ -45,12 +46,7 @@ ANNEE_COURANTE = datetime.now().year
 # ── Configuration par variables d'environnement ───────────────────────────────
 TESSERACT_CMD = os.getenv("TESSERACT_CMD", "")
 POPPLER_PATH  = os.getenv("POPPLER_PATH", "")
-OLLAMA_URL    = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "llama3.1")
-# Sans GPU, un modèle 8B met couramment plus de 3 minutes sur un CV dense.
-OLLAMA_TIMEOUT     = int(os.getenv("OLLAMA_TIMEOUT", "420"))
-OLLAMA_KEEP_ALIVE  = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
-OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1600"))
+# Les réglages du modèle de langue vivent dans core/llm.py
 OCR_LANG      = os.getenv("OCR_LANG", "fra+eng")
 OCR_DPI       = int(os.getenv("OCR_DPI", "300"))
 
@@ -183,15 +179,9 @@ def check_dependencies() -> dict:
     except Exception as e:
         status["details"]["poppler"] = str(e)
 
-    try:
-        import requests
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
-        r.raise_for_status()
-        models = [m["name"] for m in r.json().get("models", [])]
-        status["ollama"] = True
-        status["details"]["ollama"] = {"url": OLLAMA_URL, "models": models, "used": OLLAMA_MODEL}
-    except Exception as e:
-        status["details"]["ollama"] = f"indisponible ({e}) — extraction en mode dégradé sans LLM"
+    etat_llm = check_llm()
+    status["ollama"] = etat_llm["disponible"]
+    status["details"]["ollama"] = etat_llm
 
     return status
 
@@ -521,43 +511,6 @@ def _compute_experience_years(experiences: list, section_text: str) -> int:
 # Étape 3 — LLM : extraction brute (mot pour mot)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _call_ollama(prompt: str, timeout: int | None = None) -> dict:
-    """
-    Appelle Ollama en exigeant une sortie JSON.
-
-    `format: "json"` contraint le décodage au niveau du moteur : le modèle ne
-    peut plus produire de phrase d'introduction ni de bloc ```json, causes les
-    plus fréquentes d'échec de parsing. `keep_alive` garde le modèle en
-    mémoire : sans cela Ollama le décharge après quelques minutes d'inactivité
-    et la requête suivante paie plusieurs Go de rechargement avant de générer,
-    ce qui suffit à dépasser le délai sur une machine sans GPU.
-    """
-    import requests
-
-    r = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "format": "json",
-            "keep_alive": OLLAMA_KEEP_ALIVE,
-            "options": {
-                "temperature": 0,          # relevé littéral, pas de créativité
-                "num_predict": OLLAMA_NUM_PREDICT,
-            },
-        },
-        timeout=timeout or OLLAMA_TIMEOUT,
-    )
-    r.raise_for_status()
-    raw = r.json()["response"]
-    clean = raw.strip().replace("```json", "").replace("```", "").strip()
-    start, end = clean.find("{"), clean.rfind("}") + 1
-    if start >= 0 and end > start:
-        return json.loads(clean[start:end])
-    return json.loads(clean)
-
-
 _PROMPT_EXTRACTION = """Tu lis un CV. Le texte ci-dessous est organisé en sections, chacune précédée
 d'un marqueur "### NOM_DE_SECTION". Utilise ces marqueurs pour comprendre le contexte
 de chaque information (une compétence sous "### COMPÉTENCES" est plus fiable qu'un mot
@@ -598,18 +551,20 @@ CV (structuré par sections) :
 
 def _extract_with_llm(structured_text: str) -> dict | None:
     """
-    Relevé par le modèle de langue. Un premier appel peut expirer simplement
-    parce qu'Ollama chargeait le modèle ; on retente alors une fois, le modèle
-    étant désormais en mémoire.
+    Relevé par le modèle de langue, en complément des règles.
+
+    Un premier appel peut expirer simplement parce que le serveur chargeait le
+    modèle en mémoire ; on retente alors une fois, le chargement étant fait.
+    Un échec n'est jamais bloquant : le relevé par règles tient lieu de base.
     """
     import requests
 
     prompt = _PROMPT_EXTRACTION.format(structured=structured_text)
     for tentative in (1, 2):
         try:
-            result = _call_ollama(prompt)
+            result = generate_json(prompt)
             log.info("LLM (%s) : %d compétences, %d diplômes",
-                     OLLAMA_MODEL,
+                     LLM_MODEL,
                      len(result.get("competences_brutes") or []),
                      len(result.get("diplomes") or []))
             return result
