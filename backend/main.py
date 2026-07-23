@@ -12,6 +12,16 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
+
+# Le .env doit être lu AVANT l'import des modules métier : ceux-ci figent
+# leurs réglages (adresse du modèle, chemins OCR) à l'import, via os.getenv.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:  # dépendance absente : on reste sur les variables du système
+    pass
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
