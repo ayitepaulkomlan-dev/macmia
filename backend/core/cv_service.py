@@ -608,7 +608,8 @@ def _extract_with_llm(structured_text: str) -> dict | None:
     for tentative in (1, 2):
         try:
             result = _call_ollama(prompt)
-            log.info("LLM : %d compétences, %d diplômes",
+            log.info("LLM (%s) : %d compétences, %d diplômes",
+                     OLLAMA_MODEL,
                      len(result.get("competences_brutes") or []),
                      len(result.get("diplomes") or []))
             return result
